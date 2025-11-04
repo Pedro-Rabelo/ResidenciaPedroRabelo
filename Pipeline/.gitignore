@@ -1,11 +1,7 @@
 env/
 venv/
-
 data/
-
-results/
-
 weights/
-
+results/
 __pycache__/
 *.pyc
