@@ -7,7 +7,7 @@ from torchvision import transforms
 
 from models.mobilenetv3_multitask import mobilenetv3_large_multitask
 from utils.metrics import MarginCosineProduct
-from utils.dataset_landmarks import ImageFolderWithLandmarks, create_validation_split_with_landmarks
+from utils.dataset_landmarks import ImageFolderWithLandmarks, HybridDataset, create_validation_split_with_landmarks
 from utils.multitask_loss import MultiTaskLossAdvanced
 from utils.general import (
     setup_seed,
@@ -19,20 +19,45 @@ import evaluate
 
 
 def parse_arguments():
-    parser = argparse.ArgumentParser(description="VGGFace2 Multi-task Training with Landmarks")
+    parser = argparse.ArgumentParser(description="VGGFace2 Multi-task Training with Anti-Spoofing")
     
     # Dataset and Paths
     parser.add_argument(
         '--root',
         type=str,
         required=True,
-        help='Path to VGGFace2 aligned images (e.g., data/train/vggface2_aligned_112x112)'
+        help='Path to VGGFace2 aligned images'
     )
     parser.add_argument(
         '--landmarks-json',
         type=str,
         required=True,
-        help='Path to landmarks JSON file (e.g., data/train/vggface2_landmarks.json)'
+        help='Path to landmarks JSON file'
+    )
+    
+    # ========== NOVO: Parâmetros Anti-Spoofing ==========
+    parser.add_argument(
+        '--casia-root',
+        type=str,
+        default=None,
+        help='Path to CASIA-FASD dataset (optional, enables anti-spoofing)'
+    )
+    parser.add_argument(
+        '--spoofing-json',
+        type=str,
+        default=None,
+        help='Path to spoofing labels JSON for VGGFace2 (optional)'
+    )
+    parser.add_argument(
+        '--use-hybrid-dataset',
+        action='store_true',
+        help='Use hybrid dataset (VGGFace2 + CASIA-FASD)'
+    )
+    parser.add_argument(
+        '--casia-ratio',
+        type=float,
+        default=0.3,
+        help='Ratio of CASIA samples in hybrid dataset (default: 0.3)'
     )
     
     # Model Settings
@@ -100,6 +125,12 @@ def parse_arguments():
         help='Weight for landmark loss (default: 0.5)'
     )
     parser.add_argument(
+        '--spoofing-weight',
+        type=float,
+        default=0.3,
+        help='Weight for anti-spoofing loss (default: 0.3)'
+    )
+    parser.add_argument(
         '--use-wing-loss',
         action='store_true',
         help='Use Wing Loss for landmarks instead of SmoothL1'
@@ -124,7 +155,7 @@ def parse_arguments():
         '--save-path',
         type=str,
         default='weights/vggface2',
-        help='Path to save model checkpoints (default: weights/vggface2)'
+        help='Path to save model checkpoints'
     )
     parser.add_argument(
         '--checkpoint',
@@ -158,7 +189,7 @@ def parse_arguments():
         '--eval-freq',
         type=int,
         default=1,
-        help='LFW evaluation frequency in epochs (default: 1 = every epoch)'
+        help='LFW evaluation frequency in epochs (default: 1)'
     )
     
     return parser.parse_args()
@@ -174,57 +205,98 @@ def train_one_epoch_multitask(
     epoch,
     params
 ):
-    """Training loop for one epoch with multi-task learning"""
+    """Training loop for one epoch with anti-spoofing"""
     model.train()
     classification_head.train()
     
     losses_total = AverageMeter("Total Loss", ":6.3f")
     losses_cls = AverageMeter("Cls Loss", ":6.3f")
     losses_landmark = AverageMeter("Landmark Loss", ":6.3f")
+    losses_spoofing = AverageMeter("Spoof Loss", ":6.3f")  # NOVO
     accuracy_meter = AverageMeter("Accuracy", ":4.2f")
+    spoofing_acc_meter = AverageMeter("Spoof Acc", ":4.2f")  # NOVO
     batch_time = AverageMeter("Time", ":4.3f")
     
     start_time = time.time()
     last_batch_idx = len(data_loader) - 1
     
-    for batch_idx, (images, targets, landmarks_gt) in enumerate(data_loader):
+    for batch_idx, batch_data in enumerate(data_loader):
         last_batch = last_batch_idx == batch_idx
+        
+        # ========== NOVO: Desempacota 4 valores ==========
+        images, targets, landmarks_gt, is_spoof = batch_data
         
         # Move to device
         images = images.to(device)
         targets = targets.to(device)
         landmarks_gt = landmarks_gt.to(device)
+        is_spoof = is_spoof.to(device)  # NOVO
         
         # Zero gradients
         optimizer.zero_grad()
         
-        # Forward pass with multi-task
-        embeddings, landmarks_pred = model(images, return_landmarks=True)
-        
-        # Classification via MCP
-        cls_output = classification_head(embeddings, targets)
-        
-        # Multi-task loss
-        total_loss, loss_dict = criterion_multitask(
-            cls_output, 
-            landmarks_pred,
-            targets,
-            landmarks_gt
+        # ========== NOVO: Forward pass com 3 outputs ==========
+        embeddings, landmarks_pred, spoofing_pred = model(
+            images, 
+            return_landmarks=True,
+            return_spoofing=True
         )
+        
+        # Classification via MCP (apenas para samples com identidade válida)
+        # CASIA samples têm identity=-1, então precisamos filtrar
+        valid_identity_mask = targets >= 0
+        
+        if valid_identity_mask.sum() > 0:
+            # Apenas calcula classification loss para VGGFace2 samples
+            cls_output = classification_head(
+                embeddings[valid_identity_mask], 
+                targets[valid_identity_mask]
+            )
+            
+            # ========== NOVO: Multi-task loss com spoofing ==========
+            total_loss, loss_dict = criterion_multitask(
+                cls_output,
+                landmarks_pred[valid_identity_mask],
+                spoofing_pred,  # Todos os samples têm label de spoofing
+                targets[valid_identity_mask],
+                landmarks_gt[valid_identity_mask],
+                is_spoof
+            )
+            
+            # Calculate classification accuracy (apenas VGGFace2)
+            _, predicted = torch.max(cls_output.data, 1)
+            accuracy = (predicted == targets[valid_identity_mask]).float().mean() * 100
+        else:
+            # Batch contém apenas CASIA samples (sem identidade)
+            # Apenas calcula spoofing loss
+            spoofing_gt_float = is_spoof.float().unsqueeze(1)
+            spoofing_loss_fn = torch.nn.BCEWithLogitsLoss()
+            total_loss = spoofing_loss_fn(spoofing_pred, spoofing_gt_float)
+            
+            loss_dict = {
+                'total': total_loss.item(),
+                'classification': 0.0,
+                'landmark': 0.0,
+                'spoofing': total_loss.item()
+            }
+            accuracy = torch.tensor(0.0)
+        
+        # ========== NOVO: Calculate spoofing accuracy ==========
+        spoofing_probs = torch.sigmoid(spoofing_pred).squeeze()
+        spoofing_preds = (spoofing_probs > 0.5).long()
+        spoofing_accuracy = (spoofing_preds == is_spoof).float().mean() * 100
         
         # Backward pass
         total_loss.backward()
         optimizer.step()
         
-        # Calculate accuracy
-        _, predicted = torch.max(cls_output.data, 1)
-        accuracy = (predicted == targets).float().mean() * 100
-        
         # Update metrics
         losses_total.update(loss_dict['total'], images.size(0))
         losses_cls.update(loss_dict['classification'], images.size(0))
         losses_landmark.update(loss_dict['landmark'], images.size(0))
+        losses_spoofing.update(loss_dict['spoofing'], images.size(0))  # NOVO
         accuracy_meter.update(accuracy.item(), images.size(0))
+        spoofing_acc_meter.update(spoofing_accuracy.item(), images.size(0))  # NOVO
         batch_time.update(time.time() - start_time)
         
         if device.type == 'cuda':
@@ -237,9 +309,11 @@ def train_one_epoch_multitask(
             lr = optimizer.param_groups[0]['lr']
             log = (
                 f'Epoch: [{epoch}/{params.epochs}][{batch_idx:05d}/{len(data_loader):05d}] '
-                f'Loss: {losses_total.avg:6.3f} (Cls: {losses_cls.avg:6.3f}, '
-                f'Lmk: {losses_landmark.avg:6.3f}) '
+                f'Loss: {losses_total.avg:6.3f} '
+                f'(Cls: {losses_cls.avg:6.3f}, Lmk: {losses_landmark.avg:6.3f}, '
+                f'Spf: {losses_spoofing.avg:6.3f}) '  # NOVO
                 f'Acc: {accuracy_meter.avg:4.2f}% '
+                f'SpfAcc: {spoofing_acc_meter.avg:4.2f}% '  # NOVO
                 f'LR: {lr:.5f} '
                 f'Time: {batch_time.avg:4.3f}s'
             )
@@ -249,9 +323,11 @@ def train_one_epoch_multitask(
     log = (
         f'Epoch [{epoch}/{params.epochs}] Summary: '
         f'Total Loss: {losses_total.avg:6.3f}, '
-        f'Cls Loss: {losses_cls.avg:6.3f}, '
-        f'Landmark Loss: {losses_landmark.avg:6.3f}, '
-        f'Accuracy: {accuracy_meter.avg:4.2f}%'
+        f'Cls: {losses_cls.avg:6.3f}, '
+        f'Lmk: {losses_landmark.avg:6.3f}, '
+        f'Spf: {losses_spoofing.avg:6.3f}, '  # NOVO
+        f'Accuracy: {accuracy_meter.avg:4.2f}%, '
+        f'Spoof Acc: {spoofing_acc_meter.avg:4.2f}%'  # NOVO
     )
     LOGGER.info(log)
 
@@ -274,44 +350,60 @@ def main(params):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     LOGGER.info("="*70)
-    LOGGER.info("VGGFACE2 TRAINING - MULTI-TASK LEARNING")
+    LOGGER.info("VGGFACE2 TRAINING - MULTI-TASK WITH ANTI-SPOOFING")
     LOGGER.info("="*70)
     LOGGER.info(f"Device: {device}")
     LOGGER.info(f"Root: {params.root}")
     LOGGER.info(f"Landmarks: {params.landmarks_json}")
+    
+    # ========== NOVO: Log anti-spoofing config ==========
+    if params.casia_root:
+        LOGGER.info(f"CASIA-FASD: {params.casia_root}")
+        LOGGER.info(f"Anti-Spoofing: ENABLED")
+        LOGGER.info(f"Spoofing weight: {params.spoofing_weight}")
+        if params.use_hybrid_dataset:
+            LOGGER.info(f"Using HYBRID dataset (CASIA ratio: {params.casia_ratio})")
+    else:
+        LOGGER.info(f"Anti-Spoofing: DISABLED (no CASIA-FASD)")
+    
     LOGGER.info(f"Batch size: {params.batch_size}")
     LOGGER.info(f"Epochs: {params.epochs}")
-    LOGGER.info(f"Train/Val split: {params.train_split*100:.0f}%/{(1-params.train_split)*100:.0f}%")
     LOGGER.info("="*70 + "\n")
-    
-    # VGGFace2 has 8,631 identities
-    EXPECTED_NUM_CLASSES = 8631
     
     # Data transforms
     train_transform = transforms.Compose([
+        transforms.Resize((112, 112)),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
     ])
     
-    # Load dataset with landmarks
-    LOGGER.info("Loading VGGFace2 dataset with landmarks...")
-    full_dataset = ImageFolderWithLandmarks(
-        root=params.root,
-        landmarks_json=params.landmarks_json,
-        transform=train_transform,
-        min_images_per_class=params.min_images_per_class
-    )
+    # ========== NOVO: Escolhe dataset com ou sem anti-spoofing ==========
+    LOGGER.info("Loading dataset...")
+    
+    if params.use_hybrid_dataset and params.casia_root:
+        # Dataset híbrido (VGGFace2 + CASIA-FASD)
+        full_dataset = HybridDataset(
+            vggface_root=params.root,
+            landmarks_json=params.landmarks_json,
+            casia_root=params.casia_root,
+            transform=train_transform,
+            casia_ratio=params.casia_ratio
+        )
+    else:
+        # Dataset padrão (só VGGFace2, com ou sem spoofing labels)
+        full_dataset = ImageFolderWithLandmarks(
+            root=params.root,
+            landmarks_json=params.landmarks_json,
+            spoofing_json=params.spoofing_json,
+            transform=train_transform
+        )
     
     # Get actual number of classes
     num_classes = full_dataset.get_num_classes()
-    LOGGER.info(f"Dataset loaded: {num_classes:,} classes")
+    LOGGER.info(f"Dataset loaded: {num_classes:,} classes\n")
     
-    # Validation check
-    if abs(num_classes - EXPECTED_NUM_CLASSES) > 100:
-        LOGGER.warning(f"⚠️  Expected ~{EXPECTED_NUM_CLASSES:,} classes, got {num_classes:,}")
-    
-    # Split into train and validation (80/20)
+    # Split into train and validation
     val_split = 1.0 - params.train_split
     train_dataset, val_dataset = create_validation_split_with_landmarks(
         full_dataset, 
@@ -333,7 +425,7 @@ def main(params):
     )
     
     # Model with multi-task learning
-    LOGGER.info("Creating MobileNetV3-Large with multi-task learning...")
+    LOGGER.info("Creating MobileNetV3-Large with multi-task learning + anti-spoofing...")
     model = mobilenetv3_large_multitask(embedding_dim=params.embedding_dim).to(device)
     
     # Classification head (MCP - CosFace)
@@ -346,14 +438,16 @@ def main(params):
     
     LOGGER.info(f"Model created: {params.embedding_dim}D embeddings, {num_classes:,} classes")
     
-    # Multi-task loss
+    # Multi-task loss with anti-spoofing
     criterion_multitask = MultiTaskLossAdvanced(
         landmark_weight=params.landmark_weight,
+        spoofing_weight=params.spoofing_weight,
         use_wing_loss=params.use_wing_loss
     )
     
     loss_type = "Wing Loss" if params.use_wing_loss else "SmoothL1 Loss"
-    LOGGER.info(f"Loss: Classification + Landmark ({loss_type}, weight={params.landmark_weight})\n")
+    LOGGER.info(f"Loss: Classification + Landmark ({loss_type}) + Anti-Spoofing")
+    LOGGER.info(f"Weights: landmark={params.landmark_weight}, spoofing={params.spoofing_weight}\n")
     
     # Optimizer
     optimizer = torch.optim.SGD(
@@ -389,7 +483,6 @@ def main(params):
         optimizer.load_state_dict(ckpt['optimizer'])
         lr_scheduler.load_state_dict(ckpt['lr_scheduler'])
         
-        # Move optimizer states to device
         for state in optimizer.state.values():
             for k, v in state.items():
                 if isinstance(v, torch.Tensor):
@@ -438,7 +531,7 @@ def main(params):
         
         last_save_path = os.path.join(
             params.save_path,
-            'mobilenetv3_vggface2_multitask_last.ckpt'
+            'mobilenetv3_vggface2_multitask_antispoofing_last.ckpt'
         )
         save_on_master(checkpoint, last_save_path)
         
@@ -455,7 +548,7 @@ def main(params):
                 
                 best_save_path = os.path.join(
                     params.save_path,
-                    'mobilenetv3_vggface2_multitask_best.ckpt'
+                    'mobilenetv3_vggface2_multitask_antispoofing_best.ckpt'
                 )
                 save_on_master(checkpoint, best_save_path)
                 

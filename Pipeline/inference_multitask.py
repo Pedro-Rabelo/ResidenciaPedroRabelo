@@ -8,12 +8,12 @@ import cv2
 from pathlib import Path
 
 from models.mobilenetv3_multitask import mobilenetv3_large_multitask
-from uniface import RetinaFace
+from facenet_pytorch import MTCNN
 
 
 def load_multitask_model(checkpoint_path, device):
     """
-    Carrega modelo VGGFace2 treinado com multi-task learning
+    Carrega modelo VGGFace2 treinado com multi-task learning + anti-spoofing
     
     Args:
         checkpoint_path: caminho para o checkpoint (.ckpt)
@@ -49,16 +49,16 @@ def load_multitask_model(checkpoint_path, device):
 
 def align_face(img, landmarks):
     """
-    Alinha face usando os 5 landmarks
+    Alinha face usando os 5 landmarks do MTCNN
     
     Args:
         img: imagem numpy array (RGB)
-        landmarks: lista de 5 landmarks [[x,y], ...]
+        landmarks: array [5, 2] com landmarks do MTCNN
     
     Returns:
         aligned: imagem alinhada 112x112
     """
-    # Template padrão para face frontal
+    # Template padrão para face frontal (mesmo do treinamento)
     template = np.array([
         [38.2946, 51.6963],  # left eye
         [73.5318, 51.5014],  # right eye
@@ -78,19 +78,23 @@ def align_face(img, landmarks):
     return aligned
 
 
-def extract_embedding(model, img_path, detector, device, verbose=False):
+def extract_embedding(model, img_path, detector, device, 
+                     spoof_threshold=0.5, check_spoofing=True, verbose=False):
     """
-    Extrai embedding de uma imagem
+    Extrai embedding de uma imagem com detecção de spoofing
     
     Args:
         model: modelo carregado
         img_path: caminho para a imagem
-        detector: detector de faces (RetinaFace)
+        detector: detector de faces (MTCNN)
         device: torch device
+        spoof_threshold: threshold para detecção de spoofing (default: 0.5)
+        check_spoofing: se True, verifica se é spoof (default: True)
         verbose: se True, imprime informações
     
     Returns:
-        embedding: vetor de features (512D)
+        embedding: vetor de features (512D) ou None se spoof detectado
+        spoofing_score: probabilidade de ser spoof (0-1)
         status: mensagem de status
     """
     if verbose:
@@ -98,40 +102,46 @@ def extract_embedding(model, img_path, detector, device, verbose=False):
     
     # Carrega imagem
     if not os.path.exists(img_path):
-        return None, f"File not found: {img_path}"
+        return None, None, f"File not found: {img_path}"
     
     img = cv2.imread(img_path)
     if img is None:
-        return None, "Failed to load image"
+        return None, None, "Failed to load image"
     
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img_pil = Image.fromarray(img_rgb)
     
-    # Detecta faces
-    faces = detector.detect_faces(img_rgb)
+    # ========== MTCNN: Detecta faces e landmarks ==========
+    boxes, probs, landmarks = detector.detect(img_pil, landmarks=True)
     
-    if len(faces) == 0:
-        return None, "No face detected"
+    if boxes is None or len(boxes) == 0:
+        return None, None, "No face detected"
     
     # Usa a maior face se houver múltiplas
-    if len(faces) > 1:
-        faces = sorted(faces, key=lambda x: x['box'][2] * x['box'][3], reverse=True)
+    if len(boxes) > 1:
+        # Calcula área de cada bbox
+        areas = [(box[2] - box[0]) * (box[3] - box[1]) for box in boxes]
+        largest_idx = np.argmax(areas)
+        box = boxes[largest_idx]
+        landmark = landmarks[largest_idx]
+        prob = probs[largest_idx]
+        
         if verbose:
-            print(f"  ⚠️  {len(faces)} faces detectadas, usando a maior")
+            print(f"  ⚠️  {len(boxes)} faces detectadas, usando a maior (conf: {prob:.3f})")
+    else:
+        box = boxes[0]
+        landmark = landmarks[0]
+        prob = probs[0]
+        
+        if verbose:
+            print(f"  ✓ Face detectada (conf: {prob:.3f})")
     
-    face = faces[0]
-    keypoints = face['keypoints']
-    
-    # Extrai landmarks
-    landmarks = [
-        keypoints['left_eye'],
-        keypoints['right_eye'],
-        keypoints['nose'],
-        keypoints['mouth_left'],
-        keypoints['mouth_right']
-    ]
+    # MTCNN landmarks já vêm no formato correto: [[x1,y1], [x2,y2], ...]
+    # Ordem: left_eye, right_eye, nose, mouth_left, mouth_right
+    landmarks_array = np.array(landmark, dtype=np.float32)
     
     # Alinha face
-    aligned = align_face(img_rgb, landmarks)
+    aligned = align_face(img_rgb, landmarks_array)
     
     # Transforma para tensor
     transform = transforms.Compose([
@@ -141,14 +151,24 @@ def extract_embedding(model, img_path, detector, device, verbose=False):
     
     img_tensor = transform(Image.fromarray(aligned)).unsqueeze(0).to(device)
     
-    # Extrai embedding (sem landmarks na inferência)
+    # ========== Extrai embedding + score anti-spoofing ==========
     with torch.no_grad():
-        embedding = model.extract_features(img_tensor)
+        embedding, spoofing_prob = model.extract_features(
+            img_tensor, 
+            return_spoofing_score=True
+        )
+    
+    spoofing_score = spoofing_prob.item()
     
     if verbose:
         print(f"  ✓ Embedding extraído: {embedding.shape}")
+        print(f"  🔍 Spoofing score: {spoofing_score:.4f} {'(FAKE!)' if spoofing_score > spoof_threshold else '(real)'}")
     
-    return embedding.cpu().numpy(), "Success"
+    # ========== Verifica se é spoof ==========
+    if check_spoofing and spoofing_score > spoof_threshold:
+        return None, spoofing_score, f"Spoofing detected (score: {spoofing_score:.4f})"
+    
+    return embedding.cpu().numpy(), spoofing_score, "Success"
 
 
 def compute_similarity(embedding1, embedding2):
@@ -169,74 +189,116 @@ def compute_similarity(embedding1, embedding2):
     return similarity[0][0]
 
 
-def compare_two_faces(model, detector, device, img1_path, img2_path, threshold=0.35):
+def compare_two_faces(model, detector, device, img1_path, img2_path, 
+                     similarity_threshold=0.35, spoof_threshold=0.5,
+                     check_spoofing=True):
     """
     Compara duas faces e determina se são da mesma pessoa
+    Agora com detecção de spoofing integrada!
     
     Args:
         model: modelo carregado
-        detector: detector de faces
+        detector: detector de faces (MTCNN)
         device: torch device
         img1_path: caminho para primeira imagem
         img2_path: caminho para segunda imagem
-        threshold: limiar de similaridade (default: 0.35)
+        similarity_threshold: limiar de similaridade (default: 0.35)
+        spoof_threshold: limiar de spoofing (default: 0.5)
+        check_spoofing: se True, rejeita imagens com spoof (default: True)
     
     Returns:
-        similarity: valor de similaridade
+        similarity: valor de similaridade (ou None se spoof detectado)
         is_same: True se mesma pessoa, False caso contrário
+        spoof_info: dict com informações de spoofing
     """
     print("="*60)
-    print("COMPARAÇÃO DE FACES")
+    print("COMPARAÇÃO DE FACES COM ANTI-SPOOFING")
     print("="*60)
     
-    # Extrai embeddings
+    spoof_info = {
+        'img1_spoof_score': None,
+        'img2_spoof_score': None,
+        'img1_is_spoof': False,
+        'img2_is_spoof': False
+    }
+    
+    # ========== Extrai embedding 1 ==========
     print(f"\n📸 Imagem 1: {img1_path}")
-    emb1, status1 = extract_embedding(model, img1_path, detector, device, verbose=True)
+    emb1, spoof_score1, status1 = extract_embedding(
+        model, img1_path, detector, device,
+        spoof_threshold=spoof_threshold,
+        check_spoofing=check_spoofing,
+        verbose=True
+    )
+    
+    spoof_info['img1_spoof_score'] = spoof_score1
+    spoof_info['img1_is_spoof'] = spoof_score1 is not None and spoof_score1 > spoof_threshold
     
     if emb1 is None:
         print(f"❌ Erro: {status1}")
-        return None, None
+        return None, None, spoof_info
     
+    # ========== Extrai embedding 2 ==========
     print(f"\n📸 Imagem 2: {img2_path}")
-    emb2, status2 = extract_embedding(model, img2_path, detector, device, verbose=True)
+    emb2, spoof_score2, status2 = extract_embedding(
+        model, img2_path, detector, device,
+        spoof_threshold=spoof_threshold,
+        check_spoofing=check_spoofing,
+        verbose=True
+    )
+    
+    spoof_info['img2_spoof_score'] = spoof_score2
+    spoof_info['img2_is_spoof'] = spoof_score2 is not None and spoof_score2 > spoof_threshold
     
     if emb2 is None:
         print(f"❌ Erro: {status2}")
-        return None, None
+        return None, None, spoof_info
     
-    # Calcula similaridade
+    # ========== Calcula similaridade ==========
     similarity = compute_similarity(emb1, emb2)
-    is_same = similarity > threshold
+    is_same = similarity > similarity_threshold
     
+    # ========== Resultado ==========
     print(f"\n{'='*60}")
     print(f"RESULTADO")
     print(f"{'='*60}")
-    print(f"Similaridade:  {similarity:.4f}")
-    print(f"Threshold:     {threshold:.4f}")
-    print(f"Mesma pessoa:  {'✅ SIM' if is_same else '❌ NÃO'}")
+    print(f"Similaridade:       {similarity:.4f}")
+    print(f"Threshold:          {similarity_threshold:.4f}")
+    print(f"Mesma pessoa:       {'✅ SIM' if is_same else '❌ NÃO'}")
+    print(f"\n--- Anti-Spoofing ---")
+    print(f"Img1 spoof score:   {spoof_score1:.4f} {'🚨 FAKE' if spoof_info['img1_is_spoof'] else '✅ real'}")
+    print(f"Img2 spoof score:   {spoof_score2:.4f} {'🚨 FAKE' if spoof_info['img2_is_spoof'] else '✅ real'}")
+    print(f"Spoof threshold:    {spoof_threshold:.4f}")
     print(f"{'='*60}\n")
     
-    return similarity, is_same
+    return similarity, is_same, spoof_info
 
 
-def batch_extract_embeddings(model, detector, device, image_folder, output_file=None):
+def batch_extract_embeddings(model, detector, device, image_folder, 
+                             output_file=None, spoof_threshold=0.5,
+                             check_spoofing=True):
     """
     Extrai embeddings de múltiplas imagens em uma pasta
+    Agora com filtragem de spoofs!
     
     Args:
         model: modelo carregado
-        detector: detector de faces
+        detector: detector de faces (MTCNN)
         device: torch device
         image_folder: pasta com imagens
         output_file: arquivo para salvar embeddings (opcional)
+        spoof_threshold: threshold de spoofing (default: 0.5)
+        check_spoofing: se True, filtra imagens fake (default: True)
     
     Returns:
-        embeddings_dict: dicionário {filename: embedding}
+        embeddings_dict: dicionário {filename: {"embedding": [...], "spoof_score": 0.xx}}
     """
     print("="*60)
-    print(f"EXTRAÇÃO EM LOTE DE EMBEDDINGS")
+    print(f"EXTRAÇÃO EM LOTE DE EMBEDDINGS (COM ANTI-SPOOFING)")
     print("="*60)
-    print(f"Pasta: {image_folder}\n")
+    print(f"Pasta: {image_folder}")
+    print(f"Anti-spoofing: {'ATIVO' if check_spoofing else 'DESATIVADO'}")
+    print(f"Spoof threshold: {spoof_threshold}\n")
     
     image_folder = Path(image_folder)
     
@@ -250,21 +312,33 @@ def batch_extract_embeddings(model, detector, device, image_folder, output_file=
     
     embeddings_dict = {}
     success_count = 0
+    spoof_detected_count = 0
     
     for img_path in image_files:
-        embedding, status = extract_embedding(
-            model, str(img_path), detector, device, verbose=False
+        embedding, spoof_score, status = extract_embedding(
+            model, str(img_path), detector, device,
+            spoof_threshold=spoof_threshold,
+            check_spoofing=check_spoofing,
+            verbose=False
         )
         
         if embedding is not None:
-            embeddings_dict[img_path.name] = embedding.tolist()
+            embeddings_dict[img_path.name] = {
+                "embedding": embedding.tolist(),
+                "spoof_score": spoof_score
+            }
             success_count += 1
-            print(f"✓ {img_path.name}")
+            print(f"✓ {img_path.name} (spoof: {spoof_score:.3f})")
         else:
-            print(f"✗ {img_path.name} - {status}")
+            if "Spoofing detected" in status:
+                spoof_detected_count += 1
+                print(f"🚨 {img_path.name} - FAKE DETECTED (spoof: {spoof_score:.3f})")
+            else:
+                print(f"✗ {img_path.name} - {status}")
     
     print(f"\n{'='*60}")
     print(f"Sucesso: {success_count}/{len(image_files)}")
+    print(f"Spoofs detectados: {spoof_detected_count}")
     print(f"{'='*60}\n")
     
     # Salva em arquivo se especificado
@@ -277,31 +351,77 @@ def batch_extract_embeddings(model, detector, device, image_folder, output_file=
     return embeddings_dict
 
 
+def test_antispoofing_only(model, detector, device, img_path, spoof_threshold=0.5):
+    """
+    Testa apenas a detecção de spoofing (sem extrair embedding)
+    
+    Args:
+        model: modelo carregado
+        detector: detector de faces (MTCNN)
+        device: torch device
+        img_path: caminho da imagem
+        spoof_threshold: threshold (default: 0.5)
+    
+    Returns:
+        spoof_score: probabilidade de ser fake (0-1)
+        is_spoof: True se detectado como fake
+    """
+    print("="*60)
+    print("TESTE DE ANTI-SPOOFING")
+    print("="*60)
+    print(f"Imagem: {img_path}")
+    print(f"Threshold: {spoof_threshold}\n")
+    
+    _, spoof_score, status = extract_embedding(
+        model, img_path, detector, device,
+        spoof_threshold=spoof_threshold,
+        check_spoofing=False,  # Não rejeita, apenas retorna score
+        verbose=True
+    )
+    
+    if spoof_score is None:
+        print(f"\n❌ Erro: {status}")
+        return None, None
+    
+    is_spoof = spoof_score > spoof_threshold
+    
+    print(f"\n{'='*60}")
+    print(f"RESULTADO")
+    print(f"{'='*60}")
+    print(f"Spoof score:  {spoof_score:.4f}")
+    print(f"Threshold:    {spoof_threshold:.4f}")
+    print(f"Classificação: {'🚨 FAKE DETECTED' if is_spoof else '✅ REAL'}")
+    print(f"Confiança:     {abs(spoof_score - spoof_threshold):.4f}")
+    print(f"{'='*60}\n")
+    
+    return spoof_score, is_spoof
+
+
 def parse_args():
     """Parse argumentos da linha de comando"""
     parser = argparse.ArgumentParser(
-        description="Inferência com modelo VGGFace2 treinado (multi-task learning)"
+        description="Inferência com modelo VGGFace2 + Anti-Spoofing (usando MTCNN)"
     )
     
     parser.add_argument(
         '--mode',
         type=str,
-        choices=['compare', 'extract', 'batch'],
+        choices=['compare', 'extract', 'batch', 'test-spoof'],
         default='compare',
-        help='Modo de operação: compare (2 imagens), extract (1 imagem), batch (pasta)'
+        help='Modo: compare (2 imgs), extract (1 img), batch (pasta), test-spoof (só anti-spoofing)'
     )
     
     # Paths
     parser.add_argument(
         '--checkpoint',
         type=str,
-        default='weights/vggface2/mobilenetv3_vggface2_multitask_best.ckpt',
+        default='weights/vggface2/mobilenetv3_vggface2_multitask_antispoofing_best.ckpt',
         help='Caminho para o checkpoint do modelo'
     )
     parser.add_argument(
         '--img1',
         type=str,
-        help='Caminho para primeira imagem (mode=compare ou extract)'
+        help='Caminho para primeira imagem (mode=compare/extract/test-spoof)'
     )
     parser.add_argument(
         '--img2',
@@ -319,18 +439,40 @@ def parse_args():
         help='Arquivo de saída para embeddings (mode=batch)'
     )
     
-    # Parâmetros
+    # Parâmetros Anti-Spoofing
     parser.add_argument(
-        '--threshold',
+        '--similarity-threshold',
         type=float,
         default=0.35,
         help='Threshold de similaridade (default: 0.35)'
     )
     parser.add_argument(
+        '--spoof-threshold',
+        type=float,
+        default=0.5,
+        help='Threshold de spoofing (default: 0.5, range: 0-1)'
+    )
+    parser.add_argument(
+        '--disable-spoofing-check',
+        action='store_true',
+        help='Desativa verificação de spoofing (apenas extrai scores)'
+    )
+    
+    # GPU
+    parser.add_argument(
         '--gpu',
         type=int,
         default=0,
         help='GPU ID (-1 para CPU, default: 0)'
+    )
+    
+    # MTCNN params
+    parser.add_argument(
+        '--mtcnn-thresholds',
+        type=float,
+        nargs=3,
+        default=[0.6, 0.7, 0.7],
+        help='MTCNN thresholds [pnet, rnet, onet] (default: [0.6, 0.7, 0.7])'
     )
     
     return parser.parse_args()
@@ -354,12 +496,23 @@ def main():
     
     model = load_multitask_model(args.checkpoint, device)
     
-    # Inicializa detector
-    print("📷 Inicializando RetinaFace...")
-    detector = RetinaFace(gpu_id=args.gpu if args.gpu >= 0 else -1)
-    print("✓ Detector pronto\n")
+    # ========== Inicializa MTCNN ==========
+    print("📷 Inicializando MTCNN...")
+    detector = MTCNN(
+        image_size=112,
+        margin=0,
+        min_face_size=20,
+        thresholds=args.mtcnn_thresholds,
+        factor=0.709,
+        post_process=False,
+        device=device,
+        keep_all=True  # Detecta múltiplas faces
+    )
+    print("✓ MTCNN pronto\n")
     
-    # Executa modo selecionado
+    check_spoofing = not args.disable_spoofing_check
+    
+    # ========== Executa modo selecionado ==========
     if args.mode == 'compare':
         if not args.img1 or not args.img2:
             print("❌ Mode 'compare' requer --img1 e --img2")
@@ -368,7 +521,9 @@ def main():
         compare_two_faces(
             model, detector, device,
             args.img1, args.img2,
-            threshold=args.threshold
+            similarity_threshold=args.similarity_threshold,
+            spoof_threshold=args.spoof_threshold,
+            check_spoofing=check_spoofing
         )
     
     elif args.mode == 'extract':
@@ -377,14 +532,18 @@ def main():
             return
         
         print(f"📸 Extraindo embedding de: {args.img1}\n")
-        embedding, status = extract_embedding(
-            model, args.img1, detector, device, verbose=True
+        embedding, spoof_score, status = extract_embedding(
+            model, args.img1, detector, device,
+            spoof_threshold=args.spoof_threshold,
+            check_spoofing=check_spoofing,
+            verbose=True
         )
         
         if embedding is not None:
             print(f"\n✅ Embedding extraído com sucesso!")
             print(f"Shape: {embedding.shape}")
             print(f"Norma L2: {np.linalg.norm(embedding):.4f}")
+            print(f"Spoof score: {spoof_score:.4f}")
         else:
             print(f"\n❌ Falha: {status}")
     
@@ -396,7 +555,20 @@ def main():
         batch_extract_embeddings(
             model, detector, device,
             args.folder,
-            output_file=args.output
+            output_file=args.output,
+            spoof_threshold=args.spoof_threshold,
+            check_spoofing=check_spoofing
+        )
+    
+    elif args.mode == 'test-spoof':
+        if not args.img1:
+            print("❌ Mode 'test-spoof' requer --img1")
+            return
+        
+        test_antispoofing_only(
+            model, detector, device,
+            args.img1,
+            spoof_threshold=args.spoof_threshold
         )
 
 
