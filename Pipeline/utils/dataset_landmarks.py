@@ -274,29 +274,56 @@ class HybridDataset(Dataset):
 def create_validation_split_with_landmarks(dataset, val_split=0.1, seed=42):
     """
     Split estratificado considerando landmarks E spoofing
+    Funciona com ImageFolderWithLandmarks e HybridDataset
     """
     from torch.utils.data import Subset
     import random
     
     random.seed(seed)
     
+    # Detecta tipo de dataset
+    if hasattr(dataset, 'all_samples'):
+        samples = dataset.all_samples  # HybridDataset
+    elif hasattr(dataset, 'samples'):
+        samples = dataset.samples  # ImageFolderWithLandmarks
+    else:
+        raise AttributeError("Dataset não tem atributo 'samples' ou 'all_samples'")
+    
     # Organiza por classe (identidade)
     class_indices = {}
-    for idx, sample in enumerate(dataset.samples):
-        label = sample['label']
-        if label not in class_indices:
-            class_indices[label] = []
-        class_indices[label].append(idx)
+    casia_indices = []  # Samples sem identidade (CASIA)
+    
+    for idx, sample in enumerate(samples):
+        # HybridDataset usa 'identity', ImageFolderWithLandmarks usa 'label'
+        label = sample.get('identity', sample.get('label', -1))
+        
+        if label == -1:
+            # Samples CASIA (sem identidade conhecida)
+            casia_indices.append(idx)
+        else:
+            # Samples VGGFace2 (com identidade)
+            if label not in class_indices:
+                class_indices[label] = []
+            class_indices[label].append(idx)
     
     train_indices = []
     val_indices = []
     
-    # Split estratificado por identidade
+    # Split estratificado APENAS para VGGFace2
     for label, indices in class_indices.items():
         random.shuffle(indices)
         split_point = int(len(indices) * (1 - val_split))
         train_indices.extend(indices[:split_point])
         val_indices.extend(indices[split_point:])
+    
+    # Adiciona todos os samples CASIA ao treino (não valida)
+    train_indices.extend(casia_indices)
+    
+    print(f"\nDataset split:")
+    print(f"  Train (VGGFace2): {len(train_indices) - len(casia_indices)}")
+    print(f"  Train (CASIA):    {len(casia_indices)}")
+    print(f"  Total train:      {len(train_indices)}")
+    print(f"  Validation:       {len(val_indices)}")
     
     train_dataset = Subset(dataset, train_indices)
     val_dataset = Subset(dataset, val_indices)

@@ -7,11 +7,13 @@ from torchvision import transforms
 from PIL import Image
 from pathlib import Path
 from tqdm import tqdm
-from sklearn.metrics import roc_curve, auc
+from sklearn.metrics import roc_curve, auc, accuracy_score
 import matplotlib.pyplot as plt
 import json
 
 from models.mobilenetv3_multitask import mobilenetv3_large_multitask
+from utils.spoofing_dataset import CASIAFASDDataset
+
 
 def convert_to_python_types(obj):
     """Converte numpy types para Python types para serialização JSON"""
@@ -34,26 +36,54 @@ class LFWDataset(Dataset):
     
     Estrutura esperada:
         lfw_root/
-        ├── lfw/
-        │   ├── person1/
-        │   │   ├── person1_0001.jpg
-        │   │   └── person1_0002.jpg
-        │   └── person2/
-        │       └── person2_0001.jpg
-        └── pairs.txt
+        ├── person1/
+        │   ├── person1_0001.jpg
+        │   └── person1_0002.jpg
+        └── person2/
+            └── person2_0001.jpg
+        
+        pairs.txt (no diretório pai de lfw_root)
     """
     
-    def __init__(self, root, pairs_file='pairs.txt', transform=None):
+    def __init__(self, root, pairs_file=None, transform=None):
+        """
+        Args:
+            root: Path para a pasta LFW (contém as pastas de pessoas)
+            pairs_file: Path para pairs.txt (se None, procura no parent dir)
+            transform: Transformações da imagem
+        """
         self.root = Path(root)
-        self.lfw_dir = self.root / 'lfw'
-        self.pairs_file = self.root / pairs_file
+        
+        # ========== Trata o caminho do LFW corretamente ==========
+        if self.root.name == 'lfw' and self.root.exists():
+            self.lfw_dir = self.root
+        elif (self.root / 'lfw').exists():
+            self.lfw_dir = self.root / 'lfw'
+        else:
+            self.lfw_dir = self.root
+        
+        # Procura pairs.txt
+        if pairs_file is None:
+            if (self.lfw_dir / 'pairs.txt').exists():
+                self.pairs_file = self.lfw_dir / 'pairs.txt'
+            elif (self.lfw_dir.parent / 'pairs.txt').exists():
+                self.pairs_file = self.lfw_dir.parent / 'pairs.txt'
+            else:
+                raise FileNotFoundError(f"pairs.txt not found in {self.lfw_dir} or {self.lfw_dir.parent}")
+        else:
+            self.pairs_file = Path(pairs_file)
+        
         self.transform = transform
         
+        # Valida estrutura
         if not self.lfw_dir.exists():
             raise FileNotFoundError(f"LFW directory not found: {self.lfw_dir}")
         
         if not self.pairs_file.exists():
             raise FileNotFoundError(f"Pairs file not found: {self.pairs_file}")
+        
+        print(f"LFW directory: {self.lfw_dir}")
+        print(f"Pairs file: {self.pairs_file}")
         
         # Carrega pares
         self.pairs = []
@@ -68,13 +98,26 @@ class LFWDataset(Dataset):
             lines = f.readlines()
         
         # Primeira linha contém número de folds e pares por fold
-        n_folds, n_pairs = map(int, lines[0].strip().split())
+        first_line = lines[0].strip().split()
+        if len(first_line) == 2:
+            n_folds, n_pairs = map(int, first_line)
+        else:
+            # Formato alternativo: apenas número de pares
+            n_folds = 10
+            n_pairs = len(lines) // 20  # Estimativa
         
         idx = 1
         for fold in range(n_folds):
             # Pares positivos (mesma pessoa)
             for _ in range(n_pairs):
+                if idx >= len(lines):
+                    break
+                
                 parts = lines[idx].strip().split()
+                if len(parts) < 3:
+                    idx += 1
+                    continue
+                
                 name = parts[0]
                 img1_idx = int(parts[1])
                 img2_idx = int(parts[2])
@@ -82,13 +125,23 @@ class LFWDataset(Dataset):
                 img1_path = self.lfw_dir / name / f"{name}_{img1_idx:04d}.jpg"
                 img2_path = self.lfw_dir / name / f"{name}_{img2_idx:04d}.jpg"
                 
-                self.pairs.append((img1_path, img2_path))
-                self.labels.append(1)  # Mesma pessoa
+                # Só adiciona se ambas existem
+                if img1_path.exists() and img2_path.exists():
+                    self.pairs.append((img1_path, img2_path))
+                    self.labels.append(1)  # Mesma pessoa
+                
                 idx += 1
             
             # Pares negativos (pessoas diferentes)
             for _ in range(n_pairs):
+                if idx >= len(lines):
+                    break
+                
                 parts = lines[idx].strip().split()
+                if len(parts) < 4:
+                    idx += 1
+                    continue
+                
                 name1 = parts[0]
                 img1_idx = int(parts[1])
                 name2 = parts[2]
@@ -97,8 +150,11 @@ class LFWDataset(Dataset):
                 img1_path = self.lfw_dir / name1 / f"{name1}_{img1_idx:04d}.jpg"
                 img2_path = self.lfw_dir / name2 / f"{name2}_{img2_idx:04d}.jpg"
                 
-                self.pairs.append((img1_path, img2_path))
-                self.labels.append(0)  # Pessoas diferentes
+                # Só adiciona se ambas existem
+                if img1_path.exists() and img2_path.exists():
+                    self.pairs.append((img1_path, img2_path))
+                    self.labels.append(0)  # Pessoas diferentes
+                
                 idx += 1
     
     def __len__(self):
@@ -122,6 +178,7 @@ class LFWDataset(Dataset):
         
         return img1, img2, label
 
+
 def extract_features(model, dataloader, device):
     """
     Extrai features de todos os pares
@@ -142,9 +199,9 @@ def extract_features(model, dataloader, device):
             img1 = img1.to(device)
             img2 = img2.to(device)
             
-            # Extrai features (sem landmarks)
-            feat1 = model.extract_features(img1)
-            feat2 = model.extract_features(img2)
+            # Extrai features (sem landmarks e sem spoofing score)
+            feat1 = model.extract_features(img1, return_spoofing_score=False)
+            feat2 = model.extract_features(img2, return_spoofing_score=False)
             
             features1_list.append(feat1.cpu().numpy())
             features2_list.append(feat2.cpu().numpy())
@@ -165,8 +222,8 @@ def compute_similarity(features1, features2):
         similarities: array de similaridades [-1, 1]
     """
     # Normaliza features
-    features1_norm = features1 / np.linalg.norm(features1, axis=1, keepdims=True)
-    features2_norm = features2 / np.linalg.norm(features2, axis=1, keepdims=True)
+    features1_norm = features1 / (np.linalg.norm(features1, axis=1, keepdims=True) + 1e-8)
+    features2_norm = features2 / (np.linalg.norm(features2, axis=1, keepdims=True) + 1e-8)
     
     # Similaridade coseno
     similarities = np.sum(features1_norm * features2_norm, axis=1)
@@ -207,9 +264,10 @@ def compute_metrics(similarities, labels, output_dir='results'):
         else:
             tar_at_far[far_target] = 0.0
     
-    # Plota ROC curve
+    # Cria output dir
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     
+    # Plota ROC curve
     plt.figure(figsize=(10, 8))
     plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {auc_score:.4f})')
     plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', label='Random')
@@ -262,78 +320,176 @@ def compute_metrics(similarities, labels, output_dir='results'):
     return best_accuracy, best_threshold, auc_score, tar_at_far
 
 
-def eval(model, device='cuda', lfw_root='data/val', batch_size=64, num_workers=4):
+# ========== AVALIAÇÃO ANTI-SPOOFING ==========
+
+def evaluate_antispoofing(model, dataloader, device, threshold=0.5):
     """
-    Função principal de avaliação no LFW
+    Avalia anti-spoofing no CASIA-FASD
+    
+    Returns:
+        accuracy: acurácia de anti-spoofing
+        predictions: probabilidades preditas
+        labels: labels ground truth
+    """
+    model.eval()
+    
+    all_probs = []
+    all_labels = []
+    
+    with torch.no_grad():
+        for images, labels in tqdm(dataloader, desc="Evaluating anti-spoofing"):
+            images = images.to(device)
+            
+            # Extrai spoofing score
+            _, spoofing_logits = model.extract_features(
+                images, 
+                return_spoofing_score=True
+            )
+            
+            # Converte para probabilidades
+            spoofing_probs = torch.sigmoid(spoofing_logits).squeeze().cpu().numpy()
+            
+            all_probs.append(spoofing_probs)
+            all_labels.append(labels.numpy())
+    
+    predictions = np.concatenate(all_probs)
+    labels = np.concatenate(all_labels)
+    
+    # Calcula accuracy
+    binary_preds = (predictions >= threshold).astype(int)
+    accuracy = accuracy_score(labels, binary_preds)
+    
+    return accuracy, predictions, labels
+
+
+def eval(model, device='cuda', lfw_root='data/val/lfw', casia_root=None, 
+         batch_size=64, num_workers=4, spoof_threshold=0.5):
+    """
+    Função principal de avaliação
     
     Args:
         model: modelo treinado
         device: device (cuda ou cpu)
-        lfw_root: path para o dataset LFW
-        batch_size: batch size para extração de features
-        num_workers: número de workers para DataLoader
+        lfw_root: path para LFW
+        casia_root: path para CASIA-FASD (se None, não avalia anti-spoofing)
+        batch_size: batch size
+        num_workers: workers
+        spoof_threshold: threshold para anti-spoofing
     
     Returns:
-        accuracy: acurácia no melhor threshold
+        lfw_accuracy: acurácia no LFW
         metrics: dicionário com todas as métricas
     """
     print("\n" + "="*70)
-    print("LFW EVALUATION")
+    print("EVALUATION")
     print("="*70)
     
-    # Transformações (mesmas do treinamento)
+    # Transformações
     transform = transforms.Compose([
         transforms.Resize((112, 112)),
         transforms.ToTensor(),
         transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
     ])
     
-    # Carrega dataset
-    dataset = LFWDataset(root=lfw_root, transform=transform)
-    dataloader = DataLoader(
-        dataset,
+    metrics = {}
+    
+    # ========== LFW EVALUATION ==========
+    print(f"\n[1/2] LFW Evaluation")
+    print(f"LFW root: {lfw_root}")
+    
+    lfw_dataset = LFWDataset(root=lfw_root, transform=transform)
+    lfw_dataloader = DataLoader(
+        lfw_dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True
     )
     
-    # Extrai features
-    print("\nExtracting features...")
-    features1, features2, labels = extract_features(model, dataloader, device)
-    
-    # Calcula similaridades
-    print("Computing similarities...")
+    features1, features2, labels = extract_features(model, lfw_dataloader, device)
     similarities = compute_similarity(features1, features2)
+    lfw_accuracy, threshold, auc_score, tar_at_far = compute_metrics(
+        similarities, labels, output_dir='results/lfw'
+    )
     
-    # Calcula métricas
-    print("Computing metrics...")
-    accuracy, threshold, auc_score, tar_at_far = compute_metrics(similarities, labels)
-    
-    # Resultados
-    print("\n" + "="*70)
-    print("RESULTS")
-    print("="*70)
-    print(f"Accuracy:          {accuracy*100:.2f}%")
-    print(f"Best Threshold:    {threshold:.4f}")
-    print(f"AUC:               {auc_score:.4f}")
-    print(f"\nTAR @ FAR:")
-    for far, tar in tar_at_far.items():
-        print(f"  FAR = {far:6.3f}  →  TAR = {tar*100:6.2f}%")
-    print("="*70 + "\n")
-    
-    metrics = {
-        'accuracy': accuracy,
+    metrics['lfw'] = {
+        'accuracy': lfw_accuracy,
         'threshold': threshold,
         'auc': auc_score,
         'tar_at_far': tar_at_far
     }
     
-    return accuracy, metrics
+    print(f"\nLFW Results:")
+    print(f"  Accuracy:          {lfw_accuracy*100:.2f}%")
+    print(f"  Best Threshold:    {threshold:.4f}")
+    print(f"  AUC:               {auc_score:.4f}")
+    
+    # ========== ANTI-SPOOFING EVALUATION ==========
+    if casia_root is not None:
+        print(f"\n[2/2] Anti-Spoofing Evaluation (CASIA-FASD)")
+        print(f"CASIA root: {casia_root}")
+        print(f"Spoof threshold: {spoof_threshold}")
+        
+        # Avalia train + test
+        spoof_metrics = {}
+        
+        for split in ['train', 'test']:
+            print(f"\n  Evaluating {split} set...")
+            
+            try:
+                casia_dataset = CASIAFASDDataset(
+                    root=casia_root,
+                    split=split,
+                    transform=transform
+                )
+                
+                casia_dataloader = DataLoader(
+                    casia_dataset,
+                    batch_size=batch_size,
+                    shuffle=False,
+                    num_workers=num_workers,
+                    pin_memory=True
+                )
+                
+                spoof_acc, preds, labs = evaluate_antispoofing(
+                    model, casia_dataloader, device, threshold=spoof_threshold
+                )
+                
+                spoof_metrics[split] = {
+                    'accuracy': spoof_acc,
+                    'threshold': spoof_threshold,
+                    'num_samples': len(labs)
+                }
+                
+                print(f"    Accuracy (SpfAcc): {spoof_acc*100:.2f}%")
+                print(f"    Samples: {len(labs)}")
+                
+            except Exception as e:
+                print(f"    ⚠️ Warning: Could not evaluate {split} set: {e}")
+                spoof_metrics[split] = None
+        
+        metrics['antispoofing'] = spoof_metrics
+    else:
+        print(f"\n⚠️  Anti-spoofing evaluation skipped (no CASIA-FASD path provided)")
+    
+    # Resultados finais
+    print("\n" + "="*70)
+    print("FINAL RESULTS")
+    print("="*70)
+    print(f"LFW Accuracy:          {lfw_accuracy*100:.2f}%")
+    
+    if 'antispoofing' in metrics:
+        for split, spoof_data in metrics['antispoofing'].items():
+            if spoof_data is not None:
+                print(f"SpfAcc ({split}):          {spoof_data['accuracy']*100:.2f}%")
+    
+    print("="*70 + "\n")
+    
+    return lfw_accuracy, metrics
 
 
 def main():
-    parser = argparse.ArgumentParser(description='LFW Evaluation')
+    parser = argparse.ArgumentParser(description='Model Evaluation (LFW + Anti-Spoofing)')
     
     parser.add_argument(
         '--checkpoint',
@@ -344,8 +500,20 @@ def main():
     parser.add_argument(
         '--lfw-root',
         type=str,
-        default='data/val',
-        help='Path to LFW dataset (default: data/val)'
+        default='data/val/lfw',
+        help='Path to LFW dataset (default: data/val/lfw)'
+    )
+    parser.add_argument(
+        '--casia-root',
+        type=str,
+        default=None,
+        help='Path to CASIA-FASD (optional, for anti-spoofing evaluation)'
+    )
+    parser.add_argument(
+        '--spoof-threshold',
+        type=float,
+        default=0.5,
+        help='Threshold for anti-spoofing (default: 0.5)'
     )
     parser.add_argument(
         '--batch-size',
@@ -395,17 +563,20 @@ def main():
         print(f"✓ Trained with {checkpoint['num_classes']:,} classes")
     
     # Avalia
-    accuracy, metrics = eval(
+    lfw_accuracy, metrics = eval(
         model=model,
         device=device,
         lfw_root=args.lfw_root,
+        casia_root=args.casia_root,
         batch_size=args.batch_size,
-        num_workers=args.num_workers
+        num_workers=args.num_workers,
+        spoof_threshold=args.spoof_threshold
     )
     
-    # Salva métricas - ✅ CORREÇÃO APLICADA
-    metrics_file = Path(args.output_dir) / 'lfw_metrics.json'
-    metrics_clean = convert_to_python_types(metrics)  # Converte numpy types
+    # Salva métricas
+    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    metrics_file = Path(args.output_dir) / 'evaluation_metrics.json'
+    metrics_clean = convert_to_python_types(metrics)
     with open(metrics_file, 'w') as f:
         json.dump(metrics_clean, f, indent=2)
     

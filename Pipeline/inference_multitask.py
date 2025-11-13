@@ -189,6 +189,185 @@ def compute_similarity(embedding1, embedding2):
     return similarity[0][0]
 
 
+# ========== NOVO: MODO SINGLE IMAGE ==========
+
+def test_single_image(model, detector, device, img_path, spoof_threshold=0.5):
+    """
+    Testa uma única imagem para verificar se é real ou fake
+    
+    Args:
+        model: modelo carregado
+        detector: MTCNN detector
+        device: torch device
+        img_path: caminho da imagem
+        spoof_threshold: threshold de spoofing (default: 0.5)
+    
+    Returns:
+        result: dict com informações
+    """
+    print("="*60)
+    print("SINGLE IMAGE ANTI-SPOOFING TEST")
+    print("="*60)
+    print(f"Image: {img_path}")
+    print(f"Threshold: {spoof_threshold}\n")
+    
+    # Extrai embedding e spoof score
+    _, spoof_score, status = extract_embedding(
+        model, img_path, detector, device,
+        spoof_threshold=spoof_threshold,
+        check_spoofing=False,  # Não rejeita, apenas retorna score
+        verbose=True
+    )
+    
+    if spoof_score is None:
+        print(f"\n❌ Error: {status}")
+        return None
+    
+    is_spoof = spoof_score > spoof_threshold
+    confidence = abs(spoof_score - spoof_threshold)
+    
+    # Resultado
+    print(f"\n{'='*60}")
+    print(f"RESULT")
+    print(f"{'='*60}")
+    print(f"Spoof Score:    {spoof_score:.4f}")
+    print(f"Threshold:      {spoof_threshold:.4f}")
+    print(f"Classification: {'🚨 FAKE' if is_spoof else '✅ REAL'}")
+    print(f"Confidence:     {confidence:.4f}")
+    print(f"{'='*60}\n")
+    
+    result = {
+        'image': img_path,
+        'spoof_score': spoof_score,
+        'threshold': spoof_threshold,
+        'is_fake': is_spoof,
+        'confidence': confidence,
+        'status': 'FAKE' if is_spoof else 'REAL'
+    }
+    
+    return result
+
+
+# ========== NOVO: MODO PAIR (COMPARAÇÃO COM SPOOFING) ==========
+
+def compare_pair_with_spoofing(model, detector, device, img1_path, img2_path,
+                               similarity_threshold=0.35, spoof_threshold=0.5):
+    """
+    Compara par de imagens retornando:
+    1. Similaridade (mesma pessoa ou não)
+    2. Probabilidade de cada imagem ser real/fake
+    
+    Args:
+        model: modelo carregado
+        detector: MTCNN detector
+        device: torch device
+        img1_path: caminho primeira imagem
+        img2_path: caminho segunda imagem
+        similarity_threshold: threshold de similaridade (default: 0.35)
+        spoof_threshold: threshold de spoofing (default: 0.5)
+    
+    Returns:
+        result: dict com todas as informações
+    """
+    print("="*60)
+    print("PAIR COMPARISON WITH ANTI-SPOOFING")
+    print("="*60)
+    
+    # ========== Processa Imagem 1 ==========
+    print(f"\n📸 Image 1: {img1_path}")
+    emb1, spoof1, status1 = extract_embedding(
+        model, img1_path, detector, device,
+        spoof_threshold=spoof_threshold,
+        check_spoofing=False,  # Não rejeita, extrai tudo
+        verbose=True
+    )
+    
+    if emb1 is None:
+        print(f"❌ Error: {status1}")
+        return None
+    
+    # ========== Processa Imagem 2 ==========
+    print(f"\n📸 Image 2: {img2_path}")
+    emb2, spoof2, status2 = extract_embedding(
+        model, img2_path, detector, device,
+        spoof_threshold=spoof_threshold,
+        check_spoofing=False,
+        verbose=True
+    )
+    
+    if emb2 is None:
+        print(f"❌ Error: {status2}")
+        return None
+    
+    # ========== Calcula Similaridade ==========
+    similarity = compute_similarity(emb1, emb2)
+    is_same_person = similarity > similarity_threshold
+    
+    # ========== Análise de Spoofing ==========
+    img1_is_fake = spoof1 > spoof_threshold
+    img2_is_fake = spoof2 > spoof_threshold
+    both_real = not img1_is_fake and not img2_is_fake
+    
+    # ========== Resultado Completo ==========
+    print(f"\n{'='*60}")
+    print(f"RESULTS")
+    print(f"{'='*60}")
+    
+    print(f"\n--- Similarity Analysis ---")
+    print(f"Similarity Score:   {similarity:.4f}")
+    print(f"Threshold:          {similarity_threshold:.4f}")
+    print(f"Same Person:        {'✅ YES' if is_same_person else '❌ NO'}")
+    
+    print(f"\n--- Anti-Spoofing Analysis ---")
+    print(f"Image 1:")
+    print(f"  Spoof Score:      {spoof1:.4f}")
+    print(f"  Classification:   {'🚨 FAKE' if img1_is_fake else '✅ REAL'}")
+    
+    print(f"Image 2:")
+    print(f"  Spoof Score:      {spoof2:.4f}")
+    print(f"  Classification:   {'🚨 FAKE' if img2_is_fake else '✅ REAL'}")
+    
+    print(f"\nSpoof Threshold:    {spoof_threshold:.4f}")
+    
+    print(f"\n--- Final Decision ---")
+    if both_real:
+        if is_same_person:
+            decision = "✅ VERIFIED: Same person, both images are real"
+        else:
+            decision = "❌ REJECTED: Different people (both real)"
+    else:
+        decision = "🚨 REJECTED: One or both images are FAKE"
+    
+    print(f"{decision}")
+    print(f"{'='*60}\n")
+    
+    result = {
+        'similarity': {
+            'score': similarity,
+            'threshold': similarity_threshold,
+            'same_person': is_same_person
+        },
+        'image1': {
+            'path': img1_path,
+            'spoof_score': spoof1,
+            'is_fake': img1_is_fake,
+            'status': 'FAKE' if img1_is_fake else 'REAL'
+        },
+        'image2': {
+            'path': img2_path,
+            'spoof_score': spoof2,
+            'is_fake': img2_is_fake,
+            'status': 'FAKE' if img2_is_fake else 'REAL'
+        },
+        'spoof_threshold': spoof_threshold,
+        'final_decision': decision
+    }
+    
+    return result
+
+
+# ========== MODO COMPARE (ANTIGO, MANTIDO PARA COMPATIBILIDADE) ==========
+
 def compare_two_faces(model, detector, device, img1_path, img2_path, 
                      similarity_threshold=0.35, spoof_threshold=0.5,
                      check_spoofing=True):
@@ -198,7 +377,7 @@ def compare_two_faces(model, detector, device, img1_path, img2_path,
     
     Args:
         model: modelo carregado
-        detector: detector de faces (MTCNN)
+        detector: detector de faces
         device: torch device
         img1_path: caminho para primeira imagem
         img2_path: caminho para segunda imagem
@@ -406,9 +585,15 @@ def parse_args():
     parser.add_argument(
         '--mode',
         type=str,
-        choices=['compare', 'extract', 'batch', 'test-spoof'],
-        default='compare',
-        help='Modo: compare (2 imgs), extract (1 img), batch (pasta), test-spoof (só anti-spoofing)'
+        choices=['compare', 'extract', 'batch', 'test-spoof', 'single', 'pair'],
+        default='pair',
+        help='Modo: '
+             'single (test single image real/fake), '
+             'pair (compare 2 images + spoofing), '
+             'compare (deprecated, use pair), '
+             'extract (extract embedding), '
+             'batch (folder), '
+             'test-spoof (spoofing only)'
     )
     
     # Paths
@@ -421,12 +606,12 @@ def parse_args():
     parser.add_argument(
         '--img1',
         type=str,
-        help='Caminho para primeira imagem (mode=compare/extract/test-spoof)'
+        help='Caminho para primeira imagem (mode=compare/extract/test-spoof/single/pair)'
     )
     parser.add_argument(
         '--img2',
         type=str,
-        help='Caminho para segunda imagem (mode=compare)'
+        help='Caminho para segunda imagem (mode=compare/pair)'
     )
     parser.add_argument(
         '--folder',
@@ -513,7 +698,34 @@ def main():
     check_spoofing = not args.disable_spoofing_check
     
     # ========== Executa modo selecionado ==========
-    if args.mode == 'compare':
+    
+    # NOVO: Modo Single Image
+    if args.mode == 'single':
+        if not args.img1:
+            print("❌ Mode 'single' requires --img1")
+            return
+        
+        test_single_image(
+            model, detector, device,
+            args.img1,
+            spoof_threshold=args.spoof_threshold
+        )
+    
+    # NOVO: Modo Pair (substitui compare)
+    elif args.mode == 'pair':
+        if not args.img1 or not args.img2:
+            print("❌ Mode 'pair' requires --img1 and --img2")
+            return
+        
+        compare_pair_with_spoofing(
+            model, detector, device,
+            args.img1, args.img2,
+            similarity_threshold=args.similarity_threshold,
+            spoof_threshold=args.spoof_threshold
+        )
+    
+    # Modo Compare (antigo, mantido para compatibilidade)
+    elif args.mode == 'compare':
         if not args.img1 or not args.img2:
             print("❌ Mode 'compare' requer --img1 e --img2")
             return

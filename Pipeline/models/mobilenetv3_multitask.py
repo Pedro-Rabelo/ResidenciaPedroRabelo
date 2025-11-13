@@ -7,7 +7,7 @@ class MobileNetV3MultiTask(nn.Module):
     MobileNetV3 com TRÊS cabeças:
     1. Embedding head (reconhecimento facial)
     2. Landmark head (regressão de landmarks)
-    3. Spoofing head (detecção de liveness) ← NOVO
+    3. Spoofing head (detecção de liveness)
     """
     
     def __init__(self, embedding_dim=512, num_landmarks=10):
@@ -35,7 +35,7 @@ class MobileNetV3MultiTask(nn.Module):
             nn.Linear(256, num_landmarks)  # 10 valores: (x,y) * 5 landmarks
         )
         
-        # ========== NOVO: Cabeça de Anti-Spoofing ==========
+        # Cabeça de Anti-Spoofing
         self.spoofing_head = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
@@ -106,14 +106,21 @@ class MobileNetV3MultiTask(nn.Module):
             spoof_prob: [B, 1] probabilidade de ser spoof (0-1) (opcional)
         """
         if return_spoofing_score:
-            embedding, _, spoofing_logit = self.forward(
+            # ========== CORREÇÃO: Desempacota corretamente ==========
+            # Forward retorna (embedding, landmarks, spoofing_logit)
+            outputs = self.forward(
                 x, 
-                return_landmarks=False, 
+                return_landmarks=True,
                 return_spoofing=True
             )
+            
+            embedding = outputs[0]
+            spoofing_logit = outputs[2]  # Terceiro elemento
+            
             spoof_prob = torch.sigmoid(spoofing_logit)  # Converte logit para probabilidade
             return embedding, spoof_prob
         else:
+            # Retorna apenas embedding
             return self.forward(x, return_landmarks=False, return_spoofing=False)
 
 

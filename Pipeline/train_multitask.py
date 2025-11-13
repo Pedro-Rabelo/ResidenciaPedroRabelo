@@ -35,7 +35,6 @@ def parse_arguments():
         help='Path to landmarks JSON file'
     )
     
-    # ========== NOVO: Parâmetros Anti-Spoofing ==========
     parser.add_argument(
         '--casia-root',
         type=str,
@@ -212,9 +211,9 @@ def train_one_epoch_multitask(
     losses_total = AverageMeter("Total Loss", ":6.3f")
     losses_cls = AverageMeter("Cls Loss", ":6.3f")
     losses_landmark = AverageMeter("Landmark Loss", ":6.3f")
-    losses_spoofing = AverageMeter("Spoof Loss", ":6.3f")  # NOVO
+    losses_spoofing = AverageMeter("Spoof Loss", ":6.3f")
     accuracy_meter = AverageMeter("Accuracy", ":4.2f")
-    spoofing_acc_meter = AverageMeter("Spoof Acc", ":4.2f")  # NOVO
+    spoofing_acc_meter = AverageMeter("Spoof Acc", ":4.2f")
     batch_time = AverageMeter("Time", ":4.3f")
     
     start_time = time.time()
@@ -223,7 +222,6 @@ def train_one_epoch_multitask(
     for batch_idx, batch_data in enumerate(data_loader):
         last_batch = last_batch_idx == batch_idx
         
-        # ========== NOVO: Desempacota 4 valores ==========
         images, targets, landmarks_gt, is_spoof = batch_data
         
         # Move to device
@@ -235,7 +233,6 @@ def train_one_epoch_multitask(
         # Zero gradients
         optimizer.zero_grad()
         
-        # ========== NOVO: Forward pass com 3 outputs ==========
         embeddings, landmarks_pred, spoofing_pred = model(
             images, 
             return_landmarks=True,
@@ -253,7 +250,6 @@ def train_one_epoch_multitask(
                 targets[valid_identity_mask]
             )
             
-            # ========== NOVO: Multi-task loss com spoofing ==========
             total_loss, loss_dict = criterion_multitask(
                 cls_output,
                 landmarks_pred[valid_identity_mask],
@@ -281,7 +277,7 @@ def train_one_epoch_multitask(
             }
             accuracy = torch.tensor(0.0)
         
-        # ========== NOVO: Calculate spoofing accuracy ==========
+        # Calculate spoofing accuracy (para todos os samples)
         spoofing_probs = torch.sigmoid(spoofing_pred).squeeze()
         spoofing_preds = (spoofing_probs > 0.5).long()
         spoofing_accuracy = (spoofing_preds == is_spoof).float().mean() * 100
@@ -294,9 +290,9 @@ def train_one_epoch_multitask(
         losses_total.update(loss_dict['total'], images.size(0))
         losses_cls.update(loss_dict['classification'], images.size(0))
         losses_landmark.update(loss_dict['landmark'], images.size(0))
-        losses_spoofing.update(loss_dict['spoofing'], images.size(0))  # NOVO
+        losses_spoofing.update(loss_dict['spoofing'], images.size(0)) 
         accuracy_meter.update(accuracy.item(), images.size(0))
-        spoofing_acc_meter.update(spoofing_accuracy.item(), images.size(0))  # NOVO
+        spoofing_acc_meter.update(spoofing_accuracy.item(), images.size(0)) 
         batch_time.update(time.time() - start_time)
         
         if device.type == 'cuda':
@@ -311,9 +307,9 @@ def train_one_epoch_multitask(
                 f'Epoch: [{epoch}/{params.epochs}][{batch_idx:05d}/{len(data_loader):05d}] '
                 f'Loss: {losses_total.avg:6.3f} '
                 f'(Cls: {losses_cls.avg:6.3f}, Lmk: {losses_landmark.avg:6.3f}, '
-                f'Spf: {losses_spoofing.avg:6.3f}) '  # NOVO
+                f'Spf: {losses_spoofing.avg:6.3f}) ' 
                 f'Acc: {accuracy_meter.avg:4.2f}% '
-                f'SpfAcc: {spoofing_acc_meter.avg:4.2f}% '  # NOVO
+                f'SpfAcc: {spoofing_acc_meter.avg:4.2f}% '
                 f'LR: {lr:.5f} '
                 f'Time: {batch_time.avg:4.3f}s'
             )
@@ -325,9 +321,9 @@ def train_one_epoch_multitask(
         f'Total Loss: {losses_total.avg:6.3f}, '
         f'Cls: {losses_cls.avg:6.3f}, '
         f'Lmk: {losses_landmark.avg:6.3f}, '
-        f'Spf: {losses_spoofing.avg:6.3f}, '  # NOVO
+        f'Spf: {losses_spoofing.avg:6.3f}, '
         f'Accuracy: {accuracy_meter.avg:4.2f}%, '
-        f'Spoof Acc: {spoofing_acc_meter.avg:4.2f}%'  # NOVO
+        f'Spoof Acc: {spoofing_acc_meter.avg:4.2f}%'
     )
     LOGGER.info(log)
 
@@ -356,7 +352,6 @@ def main(params):
     LOGGER.info(f"Root: {params.root}")
     LOGGER.info(f"Landmarks: {params.landmarks_json}")
     
-    # ========== NOVO: Log anti-spoofing config ==========
     if params.casia_root:
         LOGGER.info(f"CASIA-FASD: {params.casia_root}")
         LOGGER.info(f"Anti-Spoofing: ENABLED")
@@ -378,7 +373,6 @@ def main(params):
         transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
     ])
     
-    # ========== NOVO: Escolhe dataset com ou sem anti-spoofing ==========
     LOGGER.info("Loading dataset...")
     
     if params.use_hybrid_dataset and params.casia_root:
