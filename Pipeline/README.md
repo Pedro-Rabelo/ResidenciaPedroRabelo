@@ -1,341 +1,228 @@
-# Pipeline de Reconhecimento Facial com Multi-Task Learning
+# Face Recognition Pipeline with Multi-Task Learning
 
-## Visão Geral
+Pipeline completo para reconhecimento facial usando MobileNetV3 com aprendizado multi-tarefa: classificação de identidades, regressão de landmarks faciais e detecção de liveness (anti-spoofing).
 
-Pipeline completo para treinamento e inferência de modelos de reconhecimento facial baseado em MobileNetV3 com aprendizado multi-tarefa (Multi-Task Learning). O sistema implementa uma arquitetura que combina classificação de identidades faciais com regressão de landmarks e detecção de liveness (anti-spoofing) como tarefas auxiliares, melhorando a robustez e qualidade dos embeddings gerados.
+## Features
 
-### Características Principais
+- **Backbone**: MobileNetV3-Large otimizado para faces
+- **Multi-Task Learning**:
+  - Classificação de identidades (CosFace/ArcFace)
+  - Regressão de 5 landmarks faciais
+  - Detecção de liveness (anti-spoofing)
+- **Detecção facial**: MTCNN com alinhamento automático
+- **Datasets**: VGGFace2 + CASIA-FASD (opcional)
+- **Validação**: LFW benchmark
 
-- Backbone MobileNetV3-Large otimizado para reconhecimento facial
-- Aprendizado multi-tarefa com classificação, regressão de landmarks e anti-spoofing
-- Anti-Spoofing integrada ao modelo
-- Suporte a dataset CASIA-FASD para treinamento anti-spoofing
-- Dataset híbrido (VGGFace2 + CASIA-FASD) para treinamento multi-objetivo
-- Detecção e alinhamento facial automatizado com MTCNN
-- Validação em benchmark LFW (Labeled Faces in the Wild)
-- Suporte a treinamento em VGGFace2 dataset
-- Inferência otimizada para CPU e GPU
-
-## Arquitetura
-
-### Modelo Multi-Task
-
-O modelo utiliza MobileNetV3-Large como backbone com três cabeças especializadas:
-
-**Embedding Head**
-- Extração de features para reconhecimento facial
-- Dimensão de embedding: 512D
-- Global Depthwise Convolution (GDC) layer
-
-**Landmark Head**
-- Predição de 5 landmarks faciais (olhos, nariz, cantos da boca)
-- Saída: 10 valores normalizados (x, y para cada landmark)
-- Arquitetura auxiliar para melhorar representações faciais
-
-**Spoofing Head**
-- Detecção de ataques de apresentação
-- Saída: 1 valor (probabilidade de ser fake, 0-1)
-- Classificação binária: real vs. fake
-
-### Função de Perda
-
-A loss total combina três objetivos:
-
-```
-L_total = L_classification + λ₁ × L_landmark + λ₂ × L_spoofing
-```
-
-- **L_classification**: Margin Cosine Product (CosFace) para classificação de identidades
-- **L_landmark**: SmoothL1 Loss ou Wing Loss para regressão de landmarks
-- **L_spoofing**: BCEWithLogitsLoss para detecção de liveness
-- **λ₁**: Peso da tarefa de landmarks (padrão: 0.5)
-- **λ₂**: Peso da tarefa anti-spoofing (padrão: 0.3)
-
-## Instalação
-
-### Requisitos
+## Installation
 
 ```bash
-torch>=1.9.0
-torchvision>=0.10.0
-opencv-python>=4.5.0
-pillow>=8.0.0
-numpy>=1.19.0
-tqdm>=4.60.0
-facenet-pytorch  # Para MTCNN
+pip install -r requirements.txt
 ```
 
-### Instalação de Dependências
+## Quick Start
+
+### 1. Prepare Dataset
+
+Crie um subset do VGGFace2 (opcional):
 
 ```bash
-pip install torch torchvision opencv-python pillow numpy tqdm
-pip install facenet-pytorch
+python create_subset.py \
+    --input-root <caminho_dataset_original> \
+    --output-root <caminho_saida_subset> \
+    --n-identities <numero_identidades>
 ```
 
-## Dataset CASIA-FASD (Opcional)
+### 2. Preprocess Images
 
-Para habilitar anti-spoofing, baixe o CASIA Face Anti-Spoofing Database.
-
-**Estrutura esperada:**
-```
-data/
-├── casia-fasd/
-│   ├── train/
-│   │   ├── live/     # Imagens reais
-│   │   └── spoof/    # Imagens fake (fotos, vídeos, máscaras)
-│   └── test/
-│       ├── live/
-│       └── spoof/
-```
-
-**Preparar metadados:**
-```bash
-python prepare_spoofing_labels.py \
-    --casia-root data/casia-fasd \
-    --output data/casia_fasd_metadata.json
-```
-
-## Uso
-
-### 1. Pré-processamento do Dataset
-
-O script de pré-processamento realiza detecção facial com MTCNN, validação, alinhamento e extração de landmarks.
+Detecta faces, alinha e extrai landmarks:
 
 ```bash
 python preprocess_with_landmarks_BATCH.py \
-    --input-root data/raw/vggface2_112x112 \
-    --output-root data/train/vggface2_aligned_112x112 \
-    --landmarks-json data/train/vggface2_landmarks.json \
-    --min-size 20 \
-    --min-images-per-class 2
+    --input-root <caminho_imagens_originais> \
+    --output-root <caminho_imagens_alinhadas> \
+    --landmarks-json <caminho_arquivo_landmarks.json> \
+    --gpu <gpu_id>
 ```
 
-**Parâmetros:**
-- `--input-root`: Diretório com imagens originais do VGGFace2
-- `--output-root`: Diretório de saída para imagens alinhadas (112x112)
-- `--landmarks-json`: Arquivo JSON para armazenar landmarks normalizados
-- `--min-size`: Tamanho mínimo da face em pixels (padrão: 20)
-- `--min-images-per-class`: Mínimo de imagens por identidade (padrão: 2)
-- `--batch-size`: Tamanho do batch para GPU (padrão: 32)
-- `--gpu`: ID da GPU (-1 para CPU, padrão: 0)
+### 3. Train Model
 
-**Saída:**
-- Imagens alinhadas em 112x112 pixels usando MTCNN
-- Arquivo JSON com landmarks normalizados
-- Estatísticas de processamento
-
-### 2. Treinamento
-
-#### Treinamento Padrão (sem anti-spoofing)
+**Sem anti-spoofing:**
 
 ```bash
 python train_multitask.py \
-    --root data/train/vggface2_aligned_112x112 \
-    --landmarks-json data/train/vggface2_landmarks.json \
-    --batch-size 256 \
-    --epochs 30 \
-    --lr 0.1 \
-    --landmark-weight 0.5 \
-    --save-path weights/vggface2 \
-    --lfw-root data/val
+    --root <caminho_imagens_alinhadas> \
+    --landmarks-json <caminho_landmarks.json> \
+    --batch-size <tamanho_batch> \
+    --epochs <numero_epochs> \
+    --lfw-root <caminho_lfw>
 ```
 
-#### Treinamento com Anti-Spoofing
+**Com anti-spoofing (requer CASIA-FASD):**
 
-**Opção: Dataset Híbrido (VGGFace2 + CASIA-FASD)**
 ```bash
 python train_multitask.py \
-    --root data/train/vggface2_aligned_112x112 \
-    --landmarks-json data/train/vggface2_landmarks.json \
-    --casia-root data/casia-fasd \
+    --root <caminho_imagens_alinhadas> \
+    --landmarks-json <caminho_landmarks.json> \
+    --casia-root <caminho_casia_fasd> \
     --use-hybrid-dataset \
-    --casia-ratio 0.3 \
-    --spoofing-weight 0.3 \
-    --batch-size 256 \
-    --epochs 30 \
-    --lr 0.1 \
-    --landmark-weight 0.5 \
-    --save-path weights/vggface2 \
-    --lfw-root data/val
+    --casia-ratio <ratio> \
+    --spoofing-weight <peso> \
+    --batch-size <tamanho_batch> \
+    --epochs <numero_epochs> \
+    --lfw-root <caminho_lfw>
 ```
 
-**Parâmetros de Dataset:**
-- `--root`: Diretório com imagens alinhadas
-- `--landmarks-json`: Arquivo JSON com landmarks
-- `--train-split`: Proporção treino/validação (padrão: 0.8)
-- `--min-images-per-class`: Mínimo de imagens por identidade (padrão: 2)
+### 4. Inference
 
-**Parâmetros Anti-Spoofing:**
-- `--casia-root`: Diretório do CASIA-FASD (habilita anti-spoofing)
-- `--use-hybrid-dataset`: Ativa dataset híbrido VGGFace2 + CASIA
-- `--casia-ratio`: Proporção de amostras CASIA (padrão: 0.3 = 30%)
-- `--spoofing-weight`: Peso da loss anti-spoofing (padrão: 0.3)
-- `--disable-spoofing-check`: Desativa verificação de spoofing
-
-**Parâmetros de Modelo:**
-- `--embedding-dim`: Dimensão do embedding (padrão: 512)
-- `--landmark-weight`: Peso da loss de landmarks (padrão: 0.5)
-- `--use-wing-loss`: Usar Wing Loss ao invés de SmoothL1
-
-**Parâmetros de Treinamento:**
-- `--batch-size`: Tamanho do batch (padrão: 256)
-- `--epochs`: Número de épocas (padrão: 30)
-- `--lr`: Learning rate inicial (padrão: 0.1)
-- `--momentum`: Momentum do SGD (padrão: 0.9)
-- `--weight-decay`: Weight decay (padrão: 5e-4)
-
-**Learning Rate Scheduler:**
-- `--milestones`: Épocas para reduzir LR (padrão: [10, 20, 25])
-- `--gamma`: Fator de decaimento do LR (padrão: 0.1)
-
-**Validação:**
-- `--lfw-root`: Diretório do dataset LFW (padrão: data/val)
-- `--eval-freq`: Frequência de avaliação em épocas (padrão: 1)
-
-**Saída:**
-- Checkpoint do último modelo: `mobilenetv3_vggface2_multitask_antispoofing_last.ckpt`
-- Checkpoint do melhor modelo: `mobilenetv3_vggface2_multitask_antispoofing_best.ckpt`
-- Logs de treinamento com loss, accuracy e LFW results
-
-### 3. Inferência
-
-O script de inferência suporta quatro modos de operação, todos com detecção automática de spoofing.
-
-#### 3.1 Comparação de Duas Faces
-
-Compara duas imagens e determina se são da mesma pessoa, com verificação de liveness.
+**Comparar duas faces:**
 
 ```bash
 python inference_multitask.py \
-    --mode compare \
-    --checkpoint weights/vggface2/mobilenetv3_vggface2_multitask_antispoofing_best.ckpt \
-    --img1 path/to/image1.jpg \
-    --img2 path/to/image2.jpg \
-    --similarity-threshold 0.35 \
-    --spoof-threshold 0.5
+    --mode pair \
+    --checkpoint <caminho_checkpoint.ckpt> \
+    --img1 <caminho_imagem1> \
+    --img2 <caminho_imagem2> \
+    --similarity-threshold <threshold> \
+    --spoof-threshold <threshold>
 ```
 
-**Saída:**
-- Valor de similaridade coseno
-- Decisão binária (mesma pessoa ou não)
-- Spoof score para cada imagem (0-1)
-- Alerta se fake detectado
-- Comparação com thresholds
-
-#### 3.2 Extração de Embedding
-
-Extrai o embedding de uma única imagem com verificação de spoofing.
+**Testar liveness:**
 
 ```bash
 python inference_multitask.py \
-    --mode extract \
-    --checkpoint weights/vggface2/mobilenetv3_vggface2_multitask_antispoofing_best.ckpt \
-    --img1 path/to/image.jpg \
-    --spoof-threshold 0.5
+    --mode single \
+    --checkpoint <caminho_checkpoint.ckpt> \
+    --img1 <caminho_imagem> \
+    --spoof-threshold <threshold>
 ```
 
-**Saída:**
-- Vetor de embedding (512D)
-- Norma L2 do embedding
-- Spoof score (probabilidade de ser fake)
-- Status da detecção facial
-
-#### 3.3 Processamento em Lote
-
-Extrai embeddings de múltiplas imagens em uma pasta com filtragem de spoofs.
+**Extrair embeddings em lote:**
 
 ```bash
 python inference_multitask.py \
     --mode batch \
-    --checkpoint weights/vggface2/mobilenetv3_vggface2_multitask_antispoofing_best.ckpt \
-    --folder path/to/images/ \
-    --output embeddings.json \
-    --spoof-threshold 0.5
+    --checkpoint <caminho_checkpoint.ckpt> \
+    --folder <caminho_pasta_imagens> \
+    --output <caminho_saida.json>
 ```
 
-**Saída:**
-- Arquivo JSON com embeddings e spoof scores
-- Relatório de sucesso/falha/spoofs detectados
-- Estatísticas de processamento
-
-#### 3.4 Teste de Anti-Spoofing
-
-Testa apenas a detecção de liveness, sem extrair embedding:
+### 5. Evaluation
 
 ```bash
-python inference_multitask.py \
-    --mode test-spoof \
-    --checkpoint weights/vggface2/mobilenetv3_vggface2_multitask_antispoofing_best.ckpt \
-    --img1 path/to/image.jpg \
-    --spoof-threshold 0.5
+python evaluate.py \
+    --checkpoint <caminho_checkpoint.ckpt> \
+    --lfw-root <caminho_lfw> \
+    --casia-root <caminho_casia_fasd> \
+    --batch-size <tamanho_batch>
 ```
 
-**Saída:**
-- Spoof score (0-1)
-- Classificação (REAL ou FAKE)
-- Confiança da predição
+## Dataset Structure
 
-**Parâmetros Gerais:**
-- `--checkpoint`: Caminho para o checkpoint do modelo
-- `--similarity-threshold`: Limiar de similaridade para comparação (padrão: 0.35)
-- `--spoof-threshold`: Limiar para classificar como fake (padrão: 0.5)
-- `--disable-spoofing-check`: Desativa rejeição automática, apenas reporta scores
-- `--gpu`: ID da GPU ou -1 para CPU (padrão: 0)
-- `--mtcnn-thresholds`: Thresholds do MTCNN [pnet, rnet, onet] (padrão: [0.6, 0.7, 0.7])
-
-## Pipeline de Pré-processamento
-
-### Etapas de Processamento
-
-1. **Detecção Facial**: MTCNN detecta faces e landmarks
-2. **Validação**: Verifica tamanho mínimo e qualidade dos landmarks
-3. **Alinhamento**: Transformação afim para normalizar pose facial
-4. **Normalização de Landmarks**: Coordenadas normalizadas para [0, 1]
-5. **Salvamento**: Imagens alinhadas e landmarks em JSON
-
-### Critérios de Validação
-
-- Tamanho mínimo da face detectada
-- Landmarks dentro da bounding box
-- Ordem vertical correta (olhos > nariz > boca)
-- Alinhamento horizontal dos olhos
-
-### Template de Alinhamento
-
-Posições padrão dos landmarks em face frontal normalizada (112x112):
+### VGGFace2
 
 ```
-Left Eye:     (38.29, 51.70)
-Right Eye:    (73.53, 51.50)
-Nose:         (56.03, 71.74)
-Mouth Left:   (41.55, 92.37)
-Mouth Right:  (70.73, 92.20)
+data/
+├── raw/
+│   └── vggface2_112x112/
+│       ├── n000001/
+│       │   ├── 0001_01.jpg
+│       │   └── ...
+│       └── ...
+└── train/
+    ├── vggface2_aligned_112x112/
+    └── vggface2_landmarks.json
 ```
 
-## Formato do Checkpoint
+### LFW (Validation)
 
-Os checkpoints salvos contêm:
+```
+data/val/
+├── lfw/
+│   ├── Aaron_Eckhart/
+│   │   └── Aaron_Eckhart_0001.jpg
+│   └── ...
+└── pairs.txt
+```
+
+### CASIA-FASD (Anti-Spoofing)
+
+```
+data/casia-fasd/
+├── train/
+│   ├── live/
+│   └── spoof/
+└── test/
+    ├── live/
+    └── spoof/
+```
+
+## Model Architecture
+
+```
+MobileNetV3-Large Backbone
+├── Feature Extractor (features)
+├── Embedding Head (GDC + Linear) → 512D embeddings
+├── Landmark Head → 10 values (5 landmarks × 2)
+└── Spoofing Head → 1 value (logit)
+```
+
+## Loss Function
+
+Combinação ponderada de três objetivos:
+- Classification: CosFace (Margin Cosine Product)
+- Landmarks: SmoothL1 Loss ou Wing Loss
+- Anti-Spoofing: BCEWithLogitsLoss
+
+## Training Arguments
+
+| Argument | Description | Default |
+|----------|-------------|---------|
+| `--root` | VGGFace2 aligned images path | Required |
+| `--landmarks-json` | Landmarks JSON file | Required |
+| `--casia-root` | CASIA-FASD path (enables anti-spoofing) | None |
+| `--use-hybrid-dataset` | Use VGGFace2 + CASIA hybrid dataset | False |
+| `--casia-ratio` | CASIA samples ratio | 0.3 |
+| `--batch-size` | Batch size | 256 |
+| `--epochs` | Number of epochs | 30 |
+| `--lr` | Initial learning rate | 0.1 |
+| `--landmark-weight` | Landmark loss weight | 0.5 |
+| `--spoofing-weight` | Anti-spoofing loss weight | 0.3 |
+| `--use-wing-loss` | Use Wing Loss for landmarks | False |
+| `--lfw-root` | LFW dataset path | data/val |
+
+## Inference Modes
+
+| Mode | Description | Required Args |
+|------|-------------|---------------|
+| `single` | Test single image for liveness | `--img1` |
+| `pair` | Compare two faces + spoofing check | `--img1`, `--img2` |
+| `compare` | Compare two faces (legacy) | `--img1`, `--img2` |
+| `extract` | Extract embedding from single image | `--img1` |
+| `batch` | Extract embeddings from folder | `--folder` |
+| `test-spoof` | Test only anti-spoofing | `--img1` |
+
+## Checkpoint Format
 
 ```python
 {
-    'epoch': int,                      # Época atual
-    'model': OrderedDict,              # Estado do modelo (inclui cabeça anti-spoofing)
-    'classification_head': OrderedDict,# Estado do MCP head
-    'optimizer': dict,                 # Estado do optimizer
-    'lr_scheduler': dict,              # Estado do scheduler
-    'best_lfw_accuracy': float,        # Melhor accuracy no LFW
-    'num_classes': int,                # Número de identidades
-    'args': Namespace                  # Argumentos de treinamento
+    'epoch': int,
+    'model': OrderedDict,                # Model state dict
+    'classification_head': OrderedDict,  # MCP head state dict
+    'optimizer': dict,
+    'lr_scheduler': dict,
+    'best_lfw_accuracy': float,
+    'num_classes': int,
+    'args': Namespace
 }
 ```
 
-## Formato do Landmarks JSON
+## Landmarks Format
 
-Estrutura do arquivo de landmarks:
+JSON file with normalized landmarks (0-1 range):
 
 ```json
 {
-    "identity_name/image_name.jpg": [
+    "identity/image.jpg": [
         x1, y1,  // Left Eye
         x2, y2,  // Right Eye
         x3, y3,  // Nose
@@ -345,78 +232,51 @@ Estrutura do arquivo de landmarks:
 }
 ```
 
-Todos os valores são normalizados para o intervalo [0, 1].
+## Evaluation Metrics
 
-## Dataset Esperado
+### Recognition (LFW)
+- Accuracy
+- ROC curve (AUC)
+- TAR @ FAR (0.1%, 1%, 10%)
 
-### VGGFace2
+### Anti-Spoofing (CASIA-FASD)
+- Accuracy (SpfAcc)
+- Per-split evaluation (train/test)
 
-Estrutura do dataset:
-
-```
-data/
-├── raw/
-│   └── vggface2_112x112/
-│       ├── n000001/
-│       │   ├── 0001_01.jpg
-│       │   ├── 0002_01.jpg
-│       │   └── ...
-│       ├── n000002/
-│       └── ...
-├── train/
-│   ├── vggface2_aligned_112x112/
-│   └── vggface2_landmarks.json
-```
-
-- Aproximadamente 8.631 identidades
-- Imagens pré-redimensionadas para 112x112 (opcional)
-- Múltiplas imagens por identidade
-
-### LFW (Validação)
+## Project Structure
 
 ```
-├── val/
-│    └── lfw/
-│       ├── Aaron_Eckhart/
-│       │   └── Aaron_Eckhart0001.jpg
-│       ├── Aaron_Guiel/
-│       └── ...
-    └──pairs.txt
+Pipeline/
+├── models/
+│   ├── mobilenetv3.py              # MobileNetV3 backbone
+│   └── mobilenetv3_multitask.py    # Multi-task wrapper
+├── utils/
+│   ├── dataset_landmarks.py        # Dataset loaders
+│   ├── metrics.py                  # CosFace, ArcFace
+│   ├── multitask_loss.py           # Multi-task loss functions
+│   ├── layers.py                   # Custom layers (GDC, SE)
+│   ├── general.py                  # Training utilities
+│   └── spoofing_dataset.py         # CASIA-FASD loader
+├── preprocess_with_landmarks_BATCH.py
+├── train_multitask.py
+├── inference_multitask.py
+├── evaluate.py
+├── create_subset.py
+└── README.md
 ```
 
-Dataset para validação de verificação facial:
-- 6.000 pares de faces
-- Split padrão para benchmark
+## Citation
 
-### CASIA-FASD (Anti-Spoofing)
+Se usar este código, considere citar:
 
-```
-├── casia-fasd/
-│   ├── train/
-│   │   ├── live/     # Imagens reais
-│   │   └── spoof/    # Ataques (foto, vídeo, máscara)
-│   └── test/
-│       ├── live/
-│       └── spoof/
+```bibtex
+@misc{face-recognition-multitask,
+  title={Face Recognition Pipeline with Multi-Task Learning},
+  author={Pedro Rabelo Mendonça},
+  year={2025}
+}
 ```
 
-Dataset para treinamento de detecção de liveness:
-- Múltiplos tipos de ataque
-- Vídeos e imagens estáticas
+## License
 
-## Métricas de Avaliação
-
-### Treinamento
-
-- **Loss Total**: Soma ponderada de classificação, landmarks e spoofing
-- **Loss de Classificação**: Cross-entropy via Margin Cosine Product
-- **Loss de Landmarks**: SmoothL1 ou Wing Loss
-- **Loss de Spoofing**: Binary Cross-Entropy para detecção de liveness
-- **Accuracy**: Precisão de classificação de identidades
-- **Spoof Accuracy**: Precisão na detecção de fakes
-
-### Validação
-
-- **LFW Accuracy**: Taxa de verificação correta no dataset LFW
-- **Curvas ROC**: True Positive Rate vs False Positive Rate
-- **TAR @ FAR**: True Accept Rate em diferentes False Accept Rates
+MIT License
